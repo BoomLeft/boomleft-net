@@ -1,0 +1,18 @@
+# cargo-audit configuration for boomleft-net
+# Run: cargo audit
+#
+# Mirrors PrivacySuite-Core-SDK/audit.toml. See also `deny.toml` for
+# the corresponding `cargo-deny` ignore with the full applicability
+# analysis.
+
+[advisories]
+# RUSTSEC-2026-0097 — `rand` ThreadRng unsoundness with custom logger.
+#
+# `boomleft-net` itself does not depend on `rand` directly. The
+# advisory can only reach our dep graph via transitive pulls of the
+# SDK's `opaque-ke` feature, which routes randomness exclusively
+# through caller-provided `OsRng`. See the SDK's `deny.toml` for the
+# full applicability analysis.
+#
+# Revisit when opaque-ke 4.x ships stable and transitions to rand 0.9.3+.
+ignore = ["RUSTSEC-2026-0097"]

@@ -1,0 +1,39 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and secrets — NEVER commit these
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+credentials.json
+secrets.toml
+*.secret
+
+# OS files
+Thumbs.db
+Desktop.ini
+
+# Coverage and profiling
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+coverage/
+
+# Node (defensive — this is a Rust crate but editors may drop things)
+/node_modules/
