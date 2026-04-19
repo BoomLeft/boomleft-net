@@ -57,14 +57,15 @@ constant_time_eq = "=0.4.2"
 # --- SDK dep — provides the canonical TRACKING_PARAMS list ---
 #
 # The family-wide tracking-parameter blocklist lives in the SDK so every
-# consumer agrees on one list. Pinning to `v0.2.0` matches
-# `boomleft-podcasts` (src-tauri/Cargo.toml) so Phase 3 Wave 1 migration
-# can lift feed_parser out of Podcasts without a SDK-version bump.
+# consumer agrees on one list. Pinning to `v0.4.0` aligns with the
+# current family-wide baseline post-Phase-4-Wave-2; the feed_parser
+# surface only touches `privacy_utils::TRACKING_PARAMS`, which has been
+# stable since v0.1.0.
 #
 # Features: `default-features = false` drops the `auth` default (we do
 # not need OPAQUE here). No features are enabled — only the
 # always-available `privacy_utils::TRACKING_PARAMS` constant is used.
-privacysuite-core-sdk = { git = "https://github.com/mkfnch/PrivacySuite-Core-SDK.git", tag = "v0.2.0", default-features = false }
+privacysuite-core-sdk = { git = "https://github.com/mkfnch/PrivacySuite-Core-SDK.git", tag = "v0.4.0", default-features = false }
 
 [dev-dependencies]
 # No extra test dependencies — all feed_parser tests use static bytes.
