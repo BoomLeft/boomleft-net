@@ -1,6 +1,6 @@
 //! BoomLeft family shared network-layer.
 //!
-//! Sibling crate to [`privacysuite-core-sdk`](https://github.com/mkfnch/PrivacySuite-Core-SDK)
+//! Sibling crate to [`privacysuite-core-sdk`](https://github.com/BoomLeft/PrivacySuite-Core-SDK)
 //! consolidating higher-level network-facing parsers and utilities used
 //! by multiple BoomLeft applications. The SDK supplies the cryptographic
 //! foundation and the canonical tracking-parameter blocklist;

@@ -1,6 +1,6 @@
 # boomleft-net
 
-> BoomLeft family shared network-layer — feed parsing, OPML, geo utilities. Sibling crate to [`privacysuite-core-sdk`](https://github.com/mkfnch/PrivacySuite-Core-SDK).
+> BoomLeft family shared network-layer — feed parsing, OPML, geo utilities. Sibling crate to [`privacysuite-core-sdk`](https://github.com/BoomLeft/PrivacySuite-Core-SDK).
 
 `boomleft-net` consolidates the network-layer code that the BoomLeft app
 family (Music, Podcasts, RSS, Weather, Shadow-Atlas, ...) keeps re-implementing.
@@ -50,7 +50,7 @@ Add as a git dependency, pinned to the tagged release:
 
 ```toml
 [dependencies]
-boomleft-net = { git = "https://github.com/mkfnch/boomleft-net", tag = "v0.1.0" }
+boomleft-net = { git = "https://github.com/BoomLeft/boomleft-net", tag = "v0.1.0" }
 ```
 
 `boomleft-net` does not opt into any SDK feature flags. If the consumer

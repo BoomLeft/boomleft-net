@@ -127,5 +127,5 @@ allow-git = [
     # PrivacySuite-Core-SDK — sibling crate, pinned to `v0.2.0` tag in
     # Cargo.toml. Git source is required because the SDK is
     # `publish = false`.
-    "https://github.com/mkfnch/PrivacySuite-Core-SDK.git",
+    "https://github.com/BoomLeft/PrivacySuite-Core-SDK.git",
 ]

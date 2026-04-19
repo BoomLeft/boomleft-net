@@ -760,7 +760,7 @@ dependencies = [
 [[package]]
 name = "privacysuite-core-sdk"
 version = "0.4.0"
-source = "git+https://github.com/mkfnch/PrivacySuite-Core-SDK?tag=v0.4.0#797aba2502843b32ed757d255c6547d81d11b3ee"
+source = "git+https://github.com/BoomLeft/PrivacySuite-Core-SDK?tag=v0.4.0#797aba2502843b32ed757d255c6547d81d11b3ee"
 dependencies = [
  "argon2",
  "base64",
