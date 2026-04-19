@@ -349,6 +349,7 @@ fn sanitize_ns2_url(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
     #[test]

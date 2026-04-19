@@ -292,6 +292,7 @@ fn sanitize_optional_url(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
     /// Minimal RSS 2.0 feed with one audio episode + NS2 extensions for testing.

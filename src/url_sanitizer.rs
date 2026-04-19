@@ -125,14 +125,23 @@ pub fn sanitize_audio_url(raw_url: &str) -> String {
     };
 
     // Validate the final URL: HTTPS only and no private/loopback hosts.
+    //
+    // Two distinct rejection paths:
+    //   * Unparseable input (never touched a tracker, not a valid URL)
+    //     → pass the original through unchanged. Callers that need HTTPS
+    //     will fail downstream on their own validation.
+    //   * Parseable but rejected (non-HTTPS scheme or private host) →
+    //     return empty string so callers must handle "sanitised away"
+    //     explicitly. Passing a dangerous URL through would enable SSRF
+    //     in any caller that doesn't re-validate.
     match validate_audio_url(&url) {
         Ok(validated) => validated,
         Err(reason) => {
+            if url::Url::parse(&url).is_err() {
+                tracing::warn!("url_sanitizer: unparseable URL — passing through");
+                return raw_url.to_string();
+            }
             tracing::warn!("url_sanitizer: final URL rejected ({}) — returning empty", reason);
-            // Return empty string instead of the dangerous URL.  Callers
-            // must handle empty audio_url gracefully (skip download).
-            // Returning the original URL would allow SSRF if any code
-            // path used it without re-validating.
             String::new()
         }
     }
@@ -195,11 +204,29 @@ fn strip_one_prefix(url: &str, p: &PrefixStrip) -> Option<String> {
     // The remainder starts after the matched path prefix.
     let remainder = path.get(p.prefix_path.len()..)?;
 
-    // The remainder may include a path extension segment (e.g. "mp3/" for
-    // Podtrac's "/redirect.mp3/https://...").  Skip to the next "/" if the
-    // prefix ends with a dot.
-    let inner_start = if p.prefix_path.ends_with('.') {
-        // Find the first "/" after the extension.
+    // The remainder can take several shapes depending on the tracker:
+    //   * chtbl.com: "/track/"  → "ABC123/https://cdn.example.com/ep.mp3"
+    //     (opaque track id, then the embedded URL after the next `/`)
+    //   * dts.podtrac.com: "/redirect."  → "mp3/https://cdn.example.com/ep.mp3"
+    //     (extension segment, then the embedded URL after the next `/`)
+    //   * prfx.byspotify.com: "/" → "https://cdn.example.com/ep.mp3"
+    //     (bare embedded URL)
+    //
+    // A find() for "https://" / "http://" anywhere in the remainder covers
+    // all of these — the embedded URL is always the substring starting
+    // from the first scheme occurrence. For prefixes that wrap a plain
+    // hostname rather than an absolute URL (some legacy trackers), fall
+    // back to prepending "https://" to the whole remainder.
+    let inner_start = if remainder.starts_with("https://") || remainder.starts_with("http://") {
+        remainder
+    } else if let Some(pos) = remainder.find("https://") {
+        remainder.get(pos..)?
+    } else if let Some(pos) = remainder.find("http://") {
+        remainder.get(pos..)?
+    } else if p.prefix_path.ends_with('.') {
+        // Extension-style prefix (Podtrac) without an embedded absolute
+        // URL — jump past the extension segment and treat the tail as a
+        // hostname-rooted path.
         remainder
             .find('/')
             .and_then(|i| remainder.get(i + 1..))
@@ -431,6 +458,7 @@ fn is_tracking_pixel(img_tag: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
     #[test]

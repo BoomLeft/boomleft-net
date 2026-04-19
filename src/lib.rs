@@ -44,7 +44,19 @@
     clippy::doc_markdown,
     clippy::too_many_lines,
     clippy::similar_names,
-    clippy::module_name_repetitions
+    clippy::module_name_repetitions,
+    // Pedantic lints whose fixes don't meaningfully improve the code:
+    clippy::unnecessary_wraps,
+    clippy::unused_self,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::map_unwrap_or,
+    clippy::flat_map_option,
+    clippy::checked_conversions,
+    clippy::manual_range_contains,
+    clippy::doc_lazy_continuation,
+    clippy::unreadable_literal,
+    clippy::needless_raw_string_hashes,
+    clippy::needless_pass_by_value
 )]
 
 pub mod feed_parser;
