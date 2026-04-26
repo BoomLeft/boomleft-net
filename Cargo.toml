@@ -9,68 +9,20 @@ license = "Proprietary"
 repository = "https://github.com/BoomLeft/boomleft-net"
 publish = false
 
-[features]
-default = []
-
 [dependencies]
-# --- Core deps for the initial `feed_parser` port ---
-# SECURITY: All dependencies `=`-pinned to exact versions, matching the
-# PrivacySuite-Core-SDK supply-chain discipline.
-
-# RSS 2.0 / Atom parsing. Version matches what boomleft-podcasts ships
-# in production (src-tauri/Cargo.toml) so the port is byte-for-byte
-# compatible with the upstream consumer.
 feed-rs = "=2.3.1"
-
-# URL parsing — used for scheme/host validation in the NS2 URL
-# sanitizer and the feed parser's audio URL hygiene. default-features
-# are kept on to match SDK usage; the `idna` unicode tables are required
-# for correct host-component comparison in the SSRF guard.
 url = "=2.5.8"
-
-# Structured error handling. The podcast feed parser returns
-# `anyhow::Result<ParsedPodcast>` in the upstream codebase; we preserve
-# that API to keep the Phase 3 consumer migration a near-zero-diff.
 anyhow = "=1.0.102"
-
-# Serialization — `ParsedPodcast`, `ParsedEpisode`, `ValueTag`, etc. are
-# all Serialize/Deserialize so callers can persist the parsed output.
 serde = { version = "=1.0.228", features = ["derive"] }
-
-# Logging — the url sanitizer warns on unusual inputs (null bytes,
-# un-validatable URLs). We keep `tracing` as a thin facade; it is safe
-# under the SDK's deny.toml ban list (no sentry / datadog / etc.) and
-# release builds compile the calls out via log-level features chosen
-# at the application layer.
 tracing = "=0.1.44"
 
-# --- Transitive version pin ---
-#
-# `constant_time_eq` 0.4.3 (the latest semver-compatible release of
-# `blake3`'s dependency at lockfile-resolution time) requires rustc
-# 1.95.0, but our `rust-toolchain.toml` pins `1.93` to match the SDK.
-# Pinning here (not a real first-party dep) holds the resolver at
-# 0.4.2, which is the version the SDK itself locks. Remove this entry
-# once the SDK rev we track is re-pinned to an MSRV ≥ 1.95 floor.
+# Transitive pin: constant_time_eq 0.4.3 requires rustc 1.95, but our
+# toolchain pins 1.93. Remove once SDK MSRV >= 1.95.
 constant_time_eq = "=0.4.2"
 
-# --- SDK dep — provides the canonical TRACKING_PARAMS list ---
-#
-# The family-wide tracking-parameter blocklist lives in the SDK so every
-# consumer agrees on one list. Pinning to `v0.4.0` aligns with the
-# current family-wide baseline post-Phase-4-Wave-2; the feed_parser
-# surface only touches `privacy_utils::TRACKING_PARAMS`, which has been
-# stable since v0.1.0.
-#
-# Features: `default-features = false` drops the `auth` default (we do
-# not need OPAQUE here). No features are enabled — only the
-# always-available `privacy_utils::TRACKING_PARAMS` constant is used.
+# Provides the canonical TRACKING_PARAMS blocklist used by the URL sanitizer.
 privacysuite-core-sdk = { git = "https://github.com/BoomLeft/PrivacySuite-Core-SDK", tag = "v0.4.0", default-features = false }
 
-[dev-dependencies]
-# No extra test dependencies — all feed_parser tests use static bytes.
-
-# --- Lint discipline (mirrors PrivacySuite-Core-SDK) ---
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"
@@ -93,7 +45,6 @@ large_stack_arrays = "warn"
 indexing_slicing = "warn"
 pedantic = { level = "warn", priority = -1 }
 
-# --- Release profile (exact mirror of PrivacySuite-Core-SDK) ---
 [profile.release]
 opt-level = 3
 lto = "fat"

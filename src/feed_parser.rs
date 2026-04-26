@@ -1,46 +1,12 @@
-//! Canonical BoomLeft RSS 2.0 + Podcast Namespace 2.0 feed parser.
+//! RSS 2.0 + Podcast Namespace 2.0 feed parser.
 //!
-//! This is the family-wide feed parser, ported from
-//! `boomleft-podcasts/src-tauri/src/feed_parser.rs` (488 LOC). It is
-//! the single source of truth for how the BoomLeft apps interpret
-//! podcast / syndication feeds.
+//! Parses already-fetched feed bytes into [`ParsedPodcast`] with episodes.
+//! Podcast Namespace 2.0 extensions (chapters, transcripts, seasons,
+//! episodes, value tags, soundbites) are extracted via [`crate::podcast_ns2`]
+//! since `feed-rs` does not expose `podcast:*` extensions.
 //!
-//! # Podcast Namespace 2.0 support
-//!
-//! The parser surfaces every Podcast Namespace 2.0 tag that the upstream
-//! Podcasts app understood, via [`crate::podcast_ns2`]:
-//!
-//! - `<podcast:chapters>` — external chapter marker file URL + MIME type.
-//! - `<podcast:transcript>` — transcript file URL + MIME type (SRT / VTT / JSON).
-//! - `<podcast:season>` — season number.
-//! - `<podcast:episode>` — episode number.
-//! - `<podcast:value>` — value-for-value (Lightning / etc.) payment metadata.
-//! - `<podcast:soundbite>` — highlight clips (start + duration + optional title).
-//!
-//! The Podcast Namespace 2.0 handling is the biggest value-add over
-//! vanilla `feed-rs`, which does not expose `podcast:*` extensions.
-//!
-//! # Expected consumers
-//!
-//! - **Podcasts** — primary consumer. Ships on SDK `v0.2.0` and will
-//!   switch to this module in Phase 3 Wave 1.
-//! - **RSS** — migrates from its own parser in Phase 3 Wave 1.
-//! - **Music** — MusicBrainz's RSS feed is a different, non-podcast
-//!   format (no enclosures, no NS2 extensions). That feed is **not**
-//!   consumed by this parser; it has its own typed-XML deserialiser
-//!   inside `boomleft-music`.
-//!
-//! # Port notes (Phase 2, v0.1.0)
-//!
-//! The upstream `fetch_and_parse` async function — which wrapped
-//! `parse_bytes` in the Podcasts app's per-podcast privacy-tier HTTP
-//! router — is intentionally NOT ported here. It depended on
-//! `crate::privacy::*`, `crate::ohttp::*`, `reqwest`, `tokio`, and
-//! `futures_util::StreamExt`, none of which `boomleft-net` 0.1.0 is
-//! permitted to introduce. Fetch responsibility belongs to the SDK's
-//! forthcoming `PrivacyClient` (gap G1); this parser takes bytes the
-//! caller already fetched. See the `PHASE 2 PORT` comment near
-//! [`parse_bytes`].
+//! All text fields are HTML-escaped, URLs are HTTPS-validated with SSRF
+//! guards, and tracking prefixes/pixels are stripped.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -107,27 +73,17 @@ pub struct ParsedEpisode {
 
 /// Parse already-fetched feed bytes into a [`ParsedPodcast`].
 ///
-/// PHASE 2 PORT: This is the only public entry point in v0.1.0. The
-/// upstream `fetch_and_parse` variant (async, uses
-/// `privacy::build_client_builder`) was not ported; network fetches are
-/// the caller's responsibility. See the module-level doc for details.
-///
 /// # Errors
 ///
 /// Returns `Err` when `bytes` is not a parseable RSS/Atom feed.
 pub fn parse_bytes(bytes: &[u8]) -> Result<ParsedPodcast> {
     let feed = feed_rs::parser::parse(bytes).context("RSS/Atom parse error")?;
 
-    // Also parse the raw XML for Podcast Namespace 2.0 extensions that
-    // feed-rs doesn't expose (chapters, transcripts, soundbites, value tags).
-    // Strip entity declarations first to prevent Billion Laughs / XXE attacks.
     let raw_xml = std::str::from_utf8(bytes).unwrap_or("");
     let clean_xml = podcast_ns2::strip_entity_declarations(raw_xml);
     let item_blocks = podcast_ns2::split_items(&clean_xml);
     let channel_ns2 = podcast_ns2::parse_podcast_ns2(&clean_xml);
 
-    // All text fields from untrusted feeds are HTML-escaped to prevent XSS
-    // when rendered in the WebView.
     let title = sanitize_text(
         &feed.title.as_ref().map(|t| t.content.clone()).unwrap_or_default()
     );
@@ -151,11 +107,10 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<ParsedPodcast> {
         .filter(|n| !n.is_empty())
         .map(|n| sanitize_text(&n));
 
-    let language = feed.language.clone();
+    let language = feed.language.as_deref().map(|l| sanitize_text(l));
 
-    let category = feed.categories.first().map(|c| c.term.clone());
+    let category = feed.categories.first().map(|c| sanitize_text(&c.term));
 
-    // Pair each feed-rs entry with its raw XML <item> block for NS2 extraction.
     let episodes: Vec<ParsedEpisode> = feed
         .entries
         .into_iter()
@@ -212,12 +167,12 @@ fn parse_episode(entry: feed_rs::model::Entry, ns2_xml: &str) -> Option<ParsedEp
         entry.id.clone()
     };
 
-    // Truncate GUIDs that are unreasonably long.
     let guid = if guid.len() > 2048 {
         guid.get(..2048).unwrap_or(&guid).to_string()
     } else {
         guid
     };
+    let guid = sanitize_text(&guid);
 
     let title = sanitize_text(
         &entry.title.as_ref().map(|t| t.content.clone()).unwrap_or_else(|| guid.clone())
@@ -235,7 +190,6 @@ fn parse_episode(entry: feed_rs::model::Entry, ns2_xml: &str) -> Option<ParsedEp
         .next()
         .map(|d| d.as_millis() as u64);
 
-    // Guard against implausible file sizes (> 2 GiB cast to i64 would overflow).
     let file_size = enclosure
         .size
         .filter(|&s| s <= u64::from(u32::MAX));
@@ -245,8 +199,6 @@ fn parse_episode(entry: feed_rs::model::Entry, ns2_xml: &str) -> Option<ParsedEp
         .or(entry.updated)
         .map(|dt| dt.timestamp());
 
-    // Podcast Namespace 2.0 fields — extracted from raw XML since feed-rs
-    // does not yet surface podcast:* namespace extensions.
     let ns2 = podcast_ns2::parse_episode_ns2(ns2_xml);
 
     Some(ParsedEpisode {
@@ -267,27 +219,26 @@ fn parse_episode(entry: feed_rs::model::Entry, ns2_xml: &str) -> Option<ParsedEp
 }
 
 /// Sanitise an optional artwork / image URL from the feed.
-/// Only HTTPS public URLs are accepted; others return None.
+/// Only HTTPS public URLs are accepted; HTTP is upgraded; others return None.
 fn sanitize_optional_url(url: &str) -> Option<String> {
-    let parsed = url::Url::parse(url).ok()?;
-    let url_str = if parsed.scheme() == "http" {
-        url.replacen("http://", "https://", 1)
-    } else if parsed.scheme() == "https" {
-        url.to_string()
-    } else {
-        return None;
-    };
+    let mut parsed = url::Url::parse(url).ok()?;
+    match parsed.scheme() {
+        "http" => {
+            if parsed.set_scheme("https").is_err() {
+                return None;
+            }
+        }
+        "https" => {}
+        _ => return None,
+    }
 
-    // Enforce the SSRF guard on artwork URLs — a malicious feed could
-    // point artwork to 169.254.169.254 or a local service, and the
-    // webview would make a request to it when rendering the <img> tag.
     if let Some(host) = parsed.host_str() {
         if crate::url_sanitizer::is_private_host(host) {
             return None;
         }
     }
 
-    Some(url_str)
+    Some(parsed.to_string())
 }
 
 #[cfg(test)]

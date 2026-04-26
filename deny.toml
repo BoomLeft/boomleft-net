@@ -1,12 +1,5 @@
 # cargo-deny configuration for boomleft-net
-# Run: cargo deny check
-#
-# Mirrors PrivacySuite-Core-SDK/deny.toml verbatim — the SDK's ban list
-# (sentry, datadog, bugsnag, rollbar, opentelemetry, prometheus, openssl,
-# openssl-sys) is the right baseline for every sibling crate in the
-# BoomLeft family. The only additions vs. the SDK baseline are in
-# [sources], where we allow-list the SDK's git repository so we can
-# depend on the tagged release without re-publishing to crates.io.
+# Mirrors PrivacySuite-Core-SDK/deny.toml ban list.
 
 [graph]
 targets = [
@@ -20,35 +13,13 @@ targets = [
 ]
 all-features = true
 
-# =========================================================================
-# Advisories — reject any crate with a known security vulnerability
-# =========================================================================
-#
-# Schema note (cargo-deny 0.19+): the legacy `vulnerability = "deny"` /
-# `unmaintained = "warn"` keys were removed; advisory severity is now
-# implicit (any listed advisory is a failure) and we only need to declare
-# how yanked crates and the ignore list are handled. See
-# https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
 [advisories]
 yanked = "deny"
 ignore = [
-    # RUSTSEC-2026-0097 — `rand` ThreadRng unsoundness with custom logger.
-    # Inherited from the SDK dependency (opaque-ke transitively pulls rand
-    # 0.8.5). boomleft-net itself uses no `rand` crate directly.
-    # See PrivacySuite-Core-SDK/deny.toml for the full applicability analysis.
+    # Transitive via SDK's opaque-ke → rand 0.8; not directly used.
     "RUSTSEC-2026-0097",
 ]
 
-# =========================================================================
-# Licenses — only allow licenses compatible with proprietary + privacy use
-# =========================================================================
-#
-# Schema note (cargo-deny 0.19+): `unlicensed`, `copyleft`, and `default`
-# keys were removed. The new model is a strict allow-list: any crate
-# whose license is not in `allow` fails the check. Keep the SDK's
-# permissive-only list (MIT, Apache-2.0, BSD variants, ISC, Unicode-3.0,
-# Zlib, CC0-1.0, BSL-1.0). Copyleft licenses (GPL / AGPL / MPL) are
-# excluded by omission, matching the proprietary-only posture.
 [licenses]
 allow = [
     "MIT",
@@ -62,36 +33,16 @@ allow = [
     "BSL-1.0",
 ]
 
-# The BoomLeft family crates (this one and privacysuite-core-sdk) declare
-# `license = "Proprietary"`, which is not a valid SPDX expression.
-# `cargo-deny` 0.19+ synthesises a phantom `unlicensed` advisory unless
-# the manifest carries a valid SPDX string or the crate is explicitly
-# listed as a "private" package that is ignored by the license check.
-# All entries here are BoomLeft-owned and published under the Proprietary
-# LICENSE file shipped in their respective repos.
 [licenses.private]
 ignore = true
 registries = []
 
-# =========================================================================
-# Bans — block specific crates that violate privacy guarantees
-# =========================================================================
 [bans]
 multiple-versions = "warn"
-# Wildcards are demoted from `deny` (SDK posture) to `warn`: the SDK
-# itself is pulled in via `git = "...", tag = "v0.2.0"` with no version
-# constraint, which cargo-deny treats as a wildcard. The git tag is
-# immutable — moving it would require a tag force-push, which is as
-# strong a guarantee as a crates.io version pin. Keeping the warn level
-# surfaces accidental `*` deps on other crates without tripping on the
-# SDK.
 wildcards = "warn"
 highlight = "all"
 
 deny = [
-    # --- Telemetry / analytics / crash reporting ---
-    # These crates collect or transmit user data, violating BoomLeft's
-    # zero-data-collection promise.
     { crate = "sentry", reason = "Crash reporting transmits data off-device" },
     { crate = "sentry-core", reason = "Crash reporting transmits data off-device" },
     { crate = "opentelemetry", reason = "Telemetry collection violates zero-data policy" },
@@ -103,29 +54,16 @@ deny = [
     { crate = "bugsnag", reason = "Crash reporting transmits data off-device" },
     { crate = "rollbar", reason = "Error reporting transmits data off-device" },
 
-    # --- Unsafe/legacy crypto that weakens guarantees ---
     { crate = "openssl", reason = "Use RustCrypto pure-Rust implementations only" },
     { crate = "openssl-sys", reason = "Use RustCrypto pure-Rust implementations only" },
     { crate = "rust-crypto", reason = "Unmaintained, known vulnerabilities — use RustCrypto" },
-
-    # --- Network crates ---
-    # hyper / reqwest are permitted as transitive dependencies of the
-    # SDK's networking feature. boomleft-net itself exposes NO network
-    # client in 0.1.0; all network access is the caller's responsibility
-    # (the port of `feed_parser::fetch_and_parse` that was async-reqwest
-    # has been held back for Phase 1's PrivacyClient gap-fill).
 ]
 
-# =========================================================================
-# Sources — only allow crates from crates.io + the SDK git repo
-# =========================================================================
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    # PrivacySuite-Core-SDK — sibling crate, pinned to `v0.2.0` tag in
-    # Cargo.toml. Git source is required because the SDK is
-    # `publish = false`.
+    # PrivacySuite-Core-SDK — pinned by tag in Cargo.toml; publish = false.
     "https://github.com/BoomLeft/PrivacySuite-Core-SDK.git",
 ]

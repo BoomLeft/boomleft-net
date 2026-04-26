@@ -1,30 +1,16 @@
 //! Podcast Namespace 2.0 extension parser.
 //!
-//! Extracts `podcast:*` elements that `feed-rs` does not yet surface:
-//!   - `<podcast:chapters>` — external chapter marker file URL
-//!   - `<podcast:transcript>` — transcript file URL + type (SRT/VTT/JSON)
-//!   - `<podcast:season>` — season number
-//!   - `<podcast:episode>` — episode number
-//!   - `<podcast:value>` — value-for-value payment metadata
-//!   - `<podcast:soundbite>` — highlight clips (start + duration)
-//!
-//! This module operates on the raw XML bytes *after* `feed-rs` has parsed
-//! the standard RSS fields.  It uses minimal string scanning (no full XML
-//! parser dependency) to extract the well-defined namespace attributes.
-//!
-//! Security:
-//! - All URLs extracted are passed through `sanitize_ns2_url` (HTTPS-only, no private IPs).
-//! - String lengths are capped to prevent memory exhaustion from adversarial feeds.
-//! - No `unsafe` code.
+//! Extracts `podcast:*` elements that `feed-rs` does not surface, using
+//! minimal string scanning on the raw XML. All URLs are HTTPS-validated
+//! with SSRF guards, text is HTML-escaped, and attribute lengths are
+//! capped.
 
 use serde::{Deserialize, Serialize};
 
 use crate::url_sanitizer::sanitize_text;
 
-/// Maximum attribute value length we'll accept (prevents DoS via multi-MB attributes).
 const MAX_ATTR_LEN: usize = 4096;
-/// Maximum size for a single `<item>` XML block (prevents DoS from entity expansion).
-const MAX_ITEM_LEN: usize = 1024 * 1024; // 1 MiB
+const MAX_ITEM_LEN: usize = 1024 * 1024;
 
 /// Podcast-level Namespace 2.0 metadata.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -82,31 +68,26 @@ pub struct ValueTag {
 pub fn parse_episode_ns2(item_xml: &str) -> EpisodeNs2 {
     let mut ns2 = EpisodeNs2::default();
 
-    // <podcast:chapters url="..." type="..."/>
     if let Some(tag) = find_tag(item_xml, "podcast:chapters") {
         ns2.chapter_url = get_attr(&tag, "url")
             .and_then(|u| sanitize_ns2_url(&u));
-        ns2.chapter_type = get_attr(&tag, "type");
+        ns2.chapter_type = get_attr(&tag, "type").map(|t| sanitize_text(&t));
     }
 
-    // <podcast:transcript url="..." type="..."/>
     if let Some(tag) = find_tag(item_xml, "podcast:transcript") {
         ns2.transcript_url = get_attr(&tag, "url")
             .and_then(|u| sanitize_ns2_url(&u));
-        ns2.transcript_type = get_attr(&tag, "type");
+        ns2.transcript_type = get_attr(&tag, "type").map(|t| sanitize_text(&t));
     }
 
-    // <podcast:season>N</podcast:season>
     if let Some(text) = find_tag_text(item_xml, "podcast:season") {
         ns2.season = text.trim().parse().ok();
     }
 
-    // <podcast:episode>N</podcast:episode>
     if let Some(text) = find_tag_text(item_xml, "podcast:episode") {
         ns2.episode_number = text.trim().parse().ok();
     }
 
-    // <podcast:soundbite startTime="..." duration="...">label</podcast:soundbite>
     for tag_match in find_all_tags(item_xml, "podcast:soundbite") {
         if let (Some(start), Some(dur)) = (
             get_attr(&tag_match.full_tag, "startTime")
@@ -143,10 +124,8 @@ pub fn parse_podcast_ns2(channel_xml: &str) -> PodcastNs2 {
     ns2
 }
 
-/// Strip `<!DOCTYPE` and `<!ENTITY` declarations from XML to prevent
-/// Billion Laughs / XXE entity expansion attacks.  The `feed-rs` parser
-/// may have already expanded entities; we strip them from the raw XML
-/// to ensure the NS2 string scanner cannot be confused by expanded content.
+/// Strip dangerous XML constructs (DOCTYPE, ENTITY, comments, CDATA)
+/// before the NS2 string scanner processes the raw XML.
 #[must_use]
 pub fn strip_entity_declarations(xml: &str) -> String {
     let mut result = String::with_capacity(xml.len());
@@ -162,7 +141,22 @@ pub fn strip_entity_declarations(xml: &str) -> String {
                 }
             }
         }
-        // Advance by one UTF-8 character (not byte) to preserve multi-byte sequences.
+        if lower_tail.starts_with("<!--") {
+            if let Some(tail) = xml.get(i..) {
+                if let Some(end) = tail.find("-->") {
+                    i += end + 3;
+                    continue;
+                }
+            }
+        }
+        if lower_tail.starts_with("<![cdata[") {
+            if let Some(tail) = xml.get(i..) {
+                if let Some(end) = tail.find("]]>") {
+                    i += end + 3;
+                    continue;
+                }
+            }
+        }
         let Some(rest) = xml.get(i..) else { break };
         if let Some(ch) = rest.chars().next() {
             result.push(ch);
@@ -174,8 +168,7 @@ pub fn strip_entity_declarations(xml: &str) -> String {
     result
 }
 
-/// Split feed XML into per-`<item>` blocks for per-episode NS2 parsing.
-/// Returns a Vec of item XML slices.  Items larger than 1 MiB are skipped.
+/// Split feed XML into per-`<item>` blocks. Items larger than 1 MiB are skipped.
 #[must_use]
 pub fn split_items(xml: &str) -> Vec<&str> {
     let lower = xml.to_lowercase();
@@ -210,8 +203,6 @@ struct TagMatch {
     inner_text: Option<String>,
 }
 
-/// Find the first occurrence of a self-closing or open tag with the given name.
-/// Returns the full tag string (e.g., `<podcast:chapters url="..." type="..."/>`).
 fn find_tag(xml: &str, tag_name: &str) -> Option<String> {
     let lower = xml.to_lowercase();
     let needle = format!("<{}", tag_name.to_lowercase());
@@ -225,7 +216,6 @@ fn find_tag(xml: &str, tag_name: &str) -> Option<String> {
     Some(tag.to_string())
 }
 
-/// Find the text content between `<tag>text</tag>`.
 fn find_tag_text(xml: &str, tag_name: &str) -> Option<String> {
     let lower = xml.to_lowercase();
     let open = format!("<{}", tag_name.to_lowercase());
@@ -244,7 +234,6 @@ fn find_tag_text(xml: &str, tag_name: &str) -> Option<String> {
     Some(text.to_string())
 }
 
-/// Find all occurrences of a tag (for repeating elements like soundbites).
 fn find_all_tags(xml: &str, tag_name: &str) -> Vec<TagMatch> {
     let lower = xml.to_lowercase();
     let needle = format!("<{}", tag_name.to_lowercase());
@@ -292,13 +281,10 @@ fn find_all_tags(xml: &str, tag_name: &str) -> Vec<TagMatch> {
     results
 }
 
-/// Extract a named attribute value from a tag string.
-/// Handles both double-quoted (`attr="val"`) and single-quoted (`attr='val'`).
 fn get_attr(tag: &str, attr_name: &str) -> Option<String> {
     let lower = tag.to_lowercase();
     let attr_lower = attr_name.to_lowercase();
 
-    // Try double quotes first, then single quotes.
     for quote in ['"', '\''] {
         let needle = format!("{attr_lower}={quote}");
         if let Some(pos) = lower.find(&needle) {
@@ -316,7 +302,6 @@ fn get_attr(tag: &str, attr_name: &str) -> Option<String> {
     None
 }
 
-/// Parse a seconds value (possibly fractional) to milliseconds.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -331,7 +316,6 @@ fn parse_seconds_to_ms(s: &str) -> Option<u64> {
     Some((secs * 1000.0) as u64)
 }
 
-/// Sanitise a URL from a Namespace 2.0 attribute — HTTPS only, no private IPs.
 fn sanitize_ns2_url(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
     if parsed.scheme() != "https" {
@@ -421,6 +405,24 @@ mod tests {
         let xml = r#"<rss><channel><item><title>A</title></item><item><title>B</title></item></channel></rss>"#;
         let items = split_items(xml);
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn test_xml_comment_stripped() {
+        let xml = r#"<item><!-- <podcast:chapters url="https://example.com/evil.json" type="application/json"/> --><podcast:season>3</podcast:season></item>"#;
+        let clean = strip_entity_declarations(xml);
+        let ns2 = parse_episode_ns2(&clean);
+        assert!(ns2.chapter_url.is_none(), "tags inside XML comments must be ignored");
+        assert_eq!(ns2.season, Some(3));
+    }
+
+    #[test]
+    fn test_cdata_stripped() {
+        let xml = r#"<item><![CDATA[<podcast:chapters url="https://example.com/evil.json" type="application/json"/>]]><podcast:season>5</podcast:season></item>"#;
+        let clean = strip_entity_declarations(xml);
+        let ns2 = parse_episode_ns2(&clean);
+        assert!(ns2.chapter_url.is_none(), "tags inside CDATA must be ignored");
+        assert_eq!(ns2.season, Some(5));
     }
 
     #[test]

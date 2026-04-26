@@ -1,68 +1,34 @@
 //! BoomLeft family shared network-layer.
 //!
-//! Sibling crate to [`privacysuite-core-sdk`](https://github.com/BoomLeft/PrivacySuite-Core-SDK)
-//! consolidating higher-level network-facing parsers and utilities used
-//! by multiple BoomLeft applications. The SDK supplies the cryptographic
-//! foundation and the canonical tracking-parameter blocklist;
-//! `boomleft-net` supplies everything above the crypto layer but below
-//! the app-specific UI.
+//! Sibling crate to [`privacysuite-core-sdk`](https://github.com/BoomLeft/PrivacySuite-Core-SDK).
+//! The SDK supplies the cryptographic foundation and tracking-parameter
+//! blocklist; this crate supplies parsers and utilities above the crypto
+//! layer but below app-specific UI.
 //!
-//! # Scope (v0.1.0)
+//! # Modules
 //!
-//! - [`feed_parser`] — RSS 2.0 + Podcast Namespace 2.0 parser. Ported
-//!   from `boomleft-podcasts` as the canonical family-wide feed parser.
-//!
-//! # Future scope
-//!
-//! - `opml` — OPML v1/v2 import/export (Phase 3 Wave 1, from
-//!   boomleft-rss).
-//! - `geo` — coordinate truncation + haversine distance (Phase 3+, from
-//!   boomleft-weather / Shadow-Atlas).
-//!
-//! # Discipline
-//!
-//! - `#![forbid(unsafe_code)]`, `#![deny(warnings)]`.
-//! - All dependencies `=`-pinned.
-//! - Same `deny.toml` ban list as the SDK (no telemetry, no openssl,
-//!   no unmaintained crypto).
+//! - [`feed_parser`] — RSS 2.0 + Podcast Namespace 2.0 parser.
+//! - [`podcast_ns2`] — Podcast Namespace 2.0 XML extension extraction.
+//! - [`url_sanitizer`] — URL sanitisation, SSRF guards, tracking-prefix stripping.
 
 #![forbid(unsafe_code)]
 #![deny(warnings)]
-// Crate-wide `clippy::pedantic` allow list. Each entry is motivated:
-//
-// * `doc_markdown` — docs contain protocol acronyms (HTTPS, SSRF, RFC-1918,
-//   MIME, SRT, VTT, APIPA, CGN, XSS, ...) that aren't backticked. Back-
-//   ticking them all would bury the prose in markup for no reader benefit.
-// * `too_many_lines` — `parse_bytes` fans out over every field of
-//   `ParsedPodcast`; splitting it would hurt readability of the single
-//   linear transformation.
-// * `similar_names` — the XML scanner uses `content_start`/`close_start`
-//   and similar pairs; they describe distinct boundaries.
-// * `module_name_repetitions` — `feed_parser::ParsedPodcast` exposes types
-//   whose names deliberately include the module's subject matter.
+// Pedantic lint allow list — each entry suppresses a false positive or
+// a lint whose "fix" would reduce readability.
 #![allow(
     clippy::doc_markdown,
     clippy::too_many_lines,
     clippy::similar_names,
     clippy::module_name_repetitions,
-    // Pedantic lints whose fixes don't meaningfully improve the code:
-    clippy::unnecessary_wraps,
-    clippy::unused_self,
     clippy::case_sensitive_file_extension_comparisons,
     clippy::map_unwrap_or,
-    clippy::flat_map_option,
-    clippy::checked_conversions,
     clippy::manual_range_contains,
     clippy::doc_lazy_continuation,
     clippy::unreadable_literal,
-    clippy::needless_raw_string_hashes,
     clippy::needless_pass_by_value
 )]
 
 pub mod feed_parser;
 
-// Re-export modules that feed_parser publicly references, so consumers
-// that only `use boomleft_net::feed_parser` can still name the types
-// that end up on `ParsedPodcast` / `ParsedEpisode`.
 pub mod podcast_ns2;
 pub mod url_sanitizer;

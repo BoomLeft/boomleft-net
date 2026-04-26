@@ -1,39 +1,12 @@
-//! Analytics prefix stripping — CRITICAL FEATURE.
+//! URL sanitisation: analytics prefix stripping, SSRF guards, and
+//! tracking parameter removal.
 //!
-//! All known tracking prefix domains are stripped before any URL is persisted
-//! or used for a download.  The blocklist is compiled-in (not fetched remotely)
-//! so that sanitisation works offline and cannot be silently disabled by a
-//! network attacker or compromised update server.
-//!
-//! Security properties enforced by this module:
-//!
-//! 1. Prefix stripping uses proper URL parsing (via the `url` crate) rather
-//!    than raw string matching, which prevents case-sensitivity bypasses and
-//!    path-traversal tricks in the remainder segment.
-//!
-//! 2. Every reconstructed inner URL is re-parsed with `url::Url::parse`.  A
-//!    remainder that does not produce a valid URL is discarded and the original
-//!    URL is returned unchanged.
-//!
-//! 3. After stripping all prefixes the final URL is validated: scheme must be
-//!    `https`, the host must not be a private/loopback/link-local address
-//!    (SSRF guard), and null bytes are rejected before parsing.
-//!
-//! 4. Tracking query parameters are removed after prefix stripping.
-//!
-//! 5. The sanitiser is idempotent: a URL that has already been sanitised passes
-//!    through unchanged.
-//!
-//! # Port notes (Phase 2 boomleft-net v0.1.0)
-//!
-//! - The async `validate_resolved_url` (DNS rebinding guard) from the
-//!   upstream `boomleft-podcasts` copy is **not** ported here; it
-//!   depended on `tokio::net::lookup_host` and an async runtime, neither
-//!   of which `boomleft-net` 0.1.0 is permitted to introduce. It will
-//!   re-appear in a later release, probably via the SDK's forthcoming
-//!   `PrivacyClient` (gap G1).
-//! - `TRACKING_PARAMS` is sourced from the SDK's `privacy_utils` module
-//!   so every BoomLeft app agrees on one blocklist.
+//! The compiled-in blocklist ensures sanitisation works offline and
+//! cannot be silently disabled by a network attacker. Every URL is
+//! parsed via the `url` crate (preventing case / path-traversal
+//! bypasses), reconstructed inner URLs are re-parsed, and the final
+//! result is validated: HTTPS only, no private/loopback/link-local
+//! hosts (SSRF guard), no null bytes. The sanitiser is idempotent.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -41,20 +14,15 @@ use std::str::FromStr;
 // ── Prefix table ──────────────────────────────────────────────────────────────
 
 /// A compile-time entry in the analytics-prefix blocklist.
-///
-/// Matches a URL whose host equals [`Self::prefix_host`] and whose path
-/// starts with [`Self::prefix_path`]. See [`sanitize_audio_url`] for
-/// how matches are consumed.
 #[derive(Debug)]
 pub struct PrefixStrip {
-    /// Lower-case host (and optional path prefix) of the tracker domain.
+    /// Lower-case tracker host.
     pub prefix_host: &'static str,
-    /// Optional path prefix to match after the host.
+    /// Path prefix to match after the host.
     pub prefix_path: &'static str,
 }
 
-/// Known analytics / tracking prefix domains, v1.0.
-/// A blocklist update requires a crate release — by design.
+/// Known analytics / tracking prefix domains.
 pub static KNOWN_PREFIXES: &[PrefixStrip] = &[
     PrefixStrip { prefix_host: "chtbl.com",            prefix_path: "/track/" },
     PrefixStrip { prefix_host: "dts.podtrac.com",      prefix_path: "/redirect." }, // .mp3, .aac, etc.
@@ -74,7 +42,6 @@ pub static KNOWN_PREFIXES: &[PrefixStrip] = &[
     PrefixStrip { prefix_host: "podder.co",            prefix_path: "/e/" },
 ];
 
-/// Use the SDK's unified tracking params list for consistency across all apps.
 use privacysuite_core_sdk::privacy_utils::TRACKING_PARAMS;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -82,28 +49,18 @@ use privacysuite_core_sdk::privacy_utils::TRACKING_PARAMS;
 /// Strip all known analytics prefixes and tracking query parameters from
 /// `raw_url`, then validate the result.
 ///
-/// SECURITY: This is a critical privacy function. All podcast feed URLs and audio URLs
-/// pass through this sanitizer. Tracking prefixes (PodTrac, Chartable, etc.) are removed
-/// before any URL is stored or used, ensuring tracking pixels and prefix redirects
-/// cannot silently re-route to trackers. The blocklist is compiled-in (not fetched)
-/// so sanitisation works offline and cannot be disabled by network attackers.
-///
-/// Returns the sanitised URL.  If the URL is malformed the original
-/// string is returned; if the final URL fails validation (non-HTTPS or
-/// private host) an empty string is returned so callers must handle
-/// "sanitised away" explicitly.
+/// Returns the sanitised URL. Malformed URLs pass through unchanged;
+/// URLs that fail validation (non-HTTPS, private host) return empty.
 #[must_use]
 pub fn sanitize_audio_url(raw_url: &str) -> String {
     // Reject null bytes up front — they cannot appear in valid URLs.
     if raw_url.contains('\0') {
-        tracing::warn!("url_sanitizer: null byte in URL, returning as-is");
-        return raw_url.to_string();
+        tracing::warn!("url_sanitizer: null byte in URL, rejecting");
+        return String::new();
     }
 
     let mut url = raw_url.trim().to_string();
 
-    // Iteratively strip prefix chains (e.g. Chartable → Podtrac → real URL).
-    // Cap iterations to prevent pathological inputs from looping forever.
     for _ in 0..=KNOWN_PREFIXES.len() {
         let mut stripped_any = false;
         for p in KNOWN_PREFIXES {
@@ -118,22 +75,11 @@ pub fn sanitize_audio_url(raw_url: &str) -> String {
         }
     }
 
-    // Remove tracking query parameters.
     url = match strip_tracking_params(&url) {
         Ok(clean) => clean,
         Err(_) => url,
     };
 
-    // Validate the final URL: HTTPS only and no private/loopback hosts.
-    //
-    // Two distinct rejection paths:
-    //   * Unparseable input (never touched a tracker, not a valid URL)
-    //     → pass the original through unchanged. Callers that need HTTPS
-    //     will fail downstream on their own validation.
-    //   * Parseable but rejected (non-HTTPS scheme or private host) →
-    //     return empty string so callers must handle "sanitised away"
-    //     explicitly. Passing a dangerous URL through would enable SSRF
-    //     in any caller that doesn't re-validate.
     match validate_audio_url(&url) {
         Ok(validated) => validated,
         Err(reason) => {
@@ -147,18 +93,12 @@ pub fn sanitize_audio_url(raw_url: &str) -> String {
     }
 }
 
-/// Enforce that a URL suitable for downloading audio is safe.
-///
-/// Rules:
-/// - Scheme must be `https` (not `http`, not `ftp`, not `file`, etc.).
-/// - Host must not be a private, loopback, or link-local address (SSRF guard).
-/// - URL must be parseable by the `url` crate.
+/// Validate that a URL is safe for audio download: HTTPS only, public
+/// host, non-empty path.
 ///
 /// # Errors
 ///
-/// Returns a human-readable `&'static str` reason when the URL is
-/// unparseable, has a non-HTTPS scheme, lacks a host, points at a
-/// private/reserved address, or has no path component.
+/// Returns a reason string when the URL fails validation.
 pub fn validate_audio_url(url: &str) -> Result<String, &'static str> {
     let parsed = url::Url::parse(url).map_err(|_| "unparseable URL")?;
 
@@ -171,7 +111,6 @@ pub fn validate_audio_url(url: &str) -> Result<String, &'static str> {
         return Err("host resolves to a private/reserved address (SSRF guard)");
     }
 
-    // Ensure there is at least a non-empty path component.
     if parsed.path().is_empty() || parsed.path() == "/" {
         return Err("URL has no path");
     }
@@ -182,41 +121,22 @@ pub fn validate_audio_url(url: &str) -> Result<String, &'static str> {
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Attempt to strip a single known prefix from `url`.
-///
-/// Uses proper URL parsing to extract host and path, avoiding case-sensitivity
-/// and path-traversal bypasses present in naive string-matching approaches.
 fn strip_one_prefix(url: &str, p: &PrefixStrip) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
 
-    // Compare host case-insensitively.
     let host = parsed.host_str()?.to_lowercase();
     if host != p.prefix_host {
         return None;
     }
 
-    // Check the path prefix (also case-insensitively).
     let path = parsed.path();
     let path_lower = path.to_lowercase();
     if !path_lower.starts_with(p.prefix_path) {
         return None;
     }
 
-    // The remainder starts after the matched path prefix.
     let remainder = path.get(p.prefix_path.len()..)?;
 
-    // The remainder can take several shapes depending on the tracker:
-    //   * chtbl.com: "/track/"  → "ABC123/https://cdn.example.com/ep.mp3"
-    //     (opaque track id, then the embedded URL after the next `/`)
-    //   * dts.podtrac.com: "/redirect."  → "mp3/https://cdn.example.com/ep.mp3"
-    //     (extension segment, then the embedded URL after the next `/`)
-    //   * prfx.byspotify.com: "/" → "https://cdn.example.com/ep.mp3"
-    //     (bare embedded URL)
-    //
-    // A find() for "https://" / "http://" anywhere in the remainder covers
-    // all of these — the embedded URL is always the substring starting
-    // from the first scheme occurrence. For prefixes that wrap a plain
-    // hostname rather than an absolute URL (some legacy trackers), fall
-    // back to prepending "https://" to the whole remainder.
     let inner_start = if remainder.starts_with("https://") || remainder.starts_with("http://") {
         remainder
     } else if let Some(pos) = remainder.find("https://") {
@@ -224,9 +144,6 @@ fn strip_one_prefix(url: &str, p: &PrefixStrip) -> Option<String> {
     } else if let Some(pos) = remainder.find("http://") {
         remainder.get(pos..)?
     } else if p.prefix_path.ends_with('.') {
-        // Extension-style prefix (Podtrac) without an embedded absolute
-        // URL — jump past the extension segment and treat the tail as a
-        // hostname-rooted path.
         remainder
             .find('/')
             .and_then(|i| remainder.get(i + 1..))
@@ -239,23 +156,18 @@ fn strip_one_prefix(url: &str, p: &PrefixStrip) -> Option<String> {
         return None;
     }
 
-    // Reconstruct the inner URL.
     let inner = if inner_start.starts_with("https://") || inner_start.starts_with("http://") {
         inner_start.to_string()
     } else {
         format!("https://{inner_start}")
     };
 
-    // Validate that the reconstruction produced a parseable URL.
     let _parsed_inner = url::Url::parse(&inner).ok()?;
-
-    // Upgrade http → https in the inner URL.
     let inner = inner.replacen("http://", "https://", 1);
 
     Some(inner)
 }
 
-/// Remove tracking query parameters while preserving all other parameters.
 fn strip_tracking_params(url: &str) -> Result<String, url::ParseError> {
     let mut parsed = url::Url::parse(url)?;
 
@@ -283,33 +195,26 @@ fn strip_tracking_params(url: &str) -> Result<String, url::ParseError> {
     Ok(parsed.to_string())
 }
 
-/// Returns `true` if `host` is a private, loopback, or link-local address.
-///
-/// Covers IPv4 RFC-1918, loopback (127.x, ::1), link-local (169.254.x,
-/// fe80::/10), and the APIPA / CGN ranges used by cloud metadata services
-/// (169.254.169.254, 100.64.0.0/10).
+/// Returns `true` if `host` is a private, loopback, link-local, CGNAT,
+/// or NAT64-embedded-private address.
 #[must_use]
 pub fn is_private_host(host: &str) -> bool {
     let lower = host.to_lowercase();
 
-    // Reject localhost and subdomains.
     if lower == "localhost" || lower.ends_with(".localhost") {
         return true;
     }
 
-    // Reject octal/hex IP notations used for SSRF bypass (e.g., 0x7f000001, 0177.0.0.1).
     if lower.starts_with("0x") || lower.contains(".0x") ||
        (lower.starts_with('0') && lower.contains('.') &&
         lower.split('.').any(|oct| oct.len() > 1 && oct.starts_with('0') && oct.chars().all(|c| c.is_ascii_digit()))) {
         return true;
     }
 
-    // Standard IP parsing.
     if let Ok(addr) = IpAddr::from_str(host) {
         return is_private_ip(addr);
     }
 
-    // Bracketed IPv6 ("[::1]") — strip brackets.
     if host.starts_with('[') && host.ends_with(']') {
         if let Some(inner) = host.get(1..host.len() - 1) {
             if let Ok(addr) = IpAddr::from_str(inner) {
@@ -333,10 +238,12 @@ fn is_private_ip(addr: IpAddr) -> bool {
                 || v4.is_unspecified()
         }
         IpAddr::V6(v6) => {
-            // Check IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) — these
-            // represent IPv4 addresses in IPv6 form and must be checked
-            // against the IPv4 private ranges to prevent SSRF bypass.
             if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(IpAddr::V4(v4));
+            }
+            if is_nat64_v6(v6) {
+                let octets = v6.octets();
+                let v4 = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
                 return is_private_ip(IpAddr::V4(v4));
             }
             v6.is_loopback()
@@ -348,51 +255,44 @@ fn is_private_ip(addr: IpAddr) -> bool {
 }
 
 fn is_cgnat(v4: Ipv4Addr) -> bool {
-    // 100.64.0.0/10
     let octets = v4.octets();
     octets[0] == 100 && (octets[1] & 0xC0) == 64
 }
 
 fn is_documentation(v4: Ipv4Addr) -> bool {
     let octets = v4.octets();
-    // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
     (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
         || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
         || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
 }
 
 fn is_link_local_v6(v6: Ipv6Addr) -> bool {
-    // fe80::/10
     let segments = v6.segments();
     (segments[0] & 0xFFC0) == 0xFE80
 }
 
 fn is_unique_local_v6(v6: Ipv6Addr) -> bool {
-    // fc00::/7
     let segments = v6.segments();
     (segments[0] & 0xFE00) == 0xFC00
 }
 
-// ── HTML text sanitisation ───────────────────────────────────────────────────
+/// NAT64 well-known prefix (RFC 6052).
+fn is_nat64_v6(v6: Ipv6Addr) -> bool {
+    let segments = v6.segments();
+    segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+}
 
-/// HTML-escape a text string from an untrusted RSS feed to prevent XSS.
+// ── HTML text sanitisation ──────────────────────────────────────────────
+
+/// HTML-escape a text string from an untrusted feed to prevent XSS.
 ///
-/// All feed-derived text (titles, descriptions, author names, soundbite
-/// labels, NS2 type strings) MUST pass through this before storage or
-/// rendering in the WebView.
-///
-/// SAFETY CONTEXT (audit F12):
-/// The output of this function is safe to interpolate into HTML
-/// **text-node** content and HTML **attribute-value** content
-/// (double- or single-quoted). It is **not** safe for:
-///   * `<script>` / `<style>` bodies,
-///   * URL-attribute contexts that need `javascript:` stripping
-///     (e.g. `href`, `src`) — use a URL validator for those,
-///   * `dangerouslySetInnerHTML` / direct `innerHTML` assignment,
-///   * `eval` / `Function` / JSON-as-HTML-parser paths.
-/// Reviewers: if a new sink emerges in the React layer, confirm that
-/// the text interpolated into it flows through a context-appropriate
-/// encoder — not just through `sanitize_text`.
+/// Safe for HTML text-node and attribute-value interpolation. NOT safe
+/// for script/style bodies, `innerHTML`, or URL-attribute contexts.
 #[must_use]
 pub fn sanitize_text(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -403,7 +303,6 @@ pub fn sanitize_text(input: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&#x27;"),
-            // Strip null bytes (prevent null-byte injection in downstream consumers).
             '\0' => {}
             _ => out.push(c),
         }
@@ -411,9 +310,9 @@ pub fn sanitize_text(input: &str) -> String {
     out
 }
 
-// ── Tracking pixel stripping ──────────────────────────────────────────────────
+// ── Tracking pixel stripping ────────────────────────────────────────────
 
-/// Remove 1x1 tracking pixel `<img>` tags from HTML description content.
+/// Remove tracking pixel `<img>` tags from HTML description content.
 #[must_use]
 pub fn strip_tracking_pixels(html: &str) -> String {
     let mut result = String::with_capacity(html.len());
@@ -421,8 +320,6 @@ pub fn strip_tracking_pixels(html: &str) -> String {
     let mut i = 0;
 
     while i < html.len() {
-        // Safe slice: `i` always lies on a UTF-8 char boundary because
-        // we advance by `ch.len_utf8()` below.
         if let Some(tail) = lower.get(i..) {
             if tail.starts_with("<img") {
                 if let Some(end_offset) = tail.find('>') {
@@ -435,7 +332,6 @@ pub fn strip_tracking_pixels(html: &str) -> String {
                 }
             }
         }
-        // Advance by one UTF-8 character to preserve multi-byte sequences.
         let Some(rest) = html.get(i..) else { break };
         if let Some(ch) = rest.chars().next() {
             result.push(ch);
@@ -450,8 +346,20 @@ pub fn strip_tracking_pixels(html: &str) -> String {
 
 fn is_tracking_pixel(img_tag: &str) -> bool {
     let lower = img_tag.to_lowercase();
-    (lower.contains("width=\"1\"") || lower.contains("width='1'"))
-        && (lower.contains("height=\"1\"") || lower.contains("height='1'"))
+    let tiny_width = lower.contains("width=\"1\"")
+        || lower.contains("width='1'")
+        || lower.contains("width=\"0\"")
+        || lower.contains("width='0'")
+        || lower.contains("width=\"1px\"")
+        || lower.contains("width='1px'");
+    let tiny_height = lower.contains("height=\"1\"")
+        || lower.contains("height='1'")
+        || lower.contains("height=\"0\"")
+        || lower.contains("height='0'")
+        || lower.contains("height=\"1px\"")
+        || lower.contains("height='1px'");
+    let hidden = lower.contains("display:none") || lower.contains("visibility:hidden");
+    (tiny_width && tiny_height) || hidden
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -552,8 +460,7 @@ mod tests {
     fn test_null_byte_rejected() {
         let raw = "https://cdn.example.com/ep.mp3\0malicious";
         let result = sanitize_audio_url(raw);
-        // Must not produce a usable URL; returned as-is (which fails validation later)
-        assert_eq!(result, raw);
+        assert!(result.is_empty(), "null-byte URL must be rejected");
     }
 
     #[test]
@@ -622,6 +529,31 @@ mod tests {
     #[test]
     fn test_ipv6_loopback_rejected() {
         assert!(validate_audio_url("https://[::1]/ep.mp3").is_err());
+    }
+
+    #[test]
+    fn test_hidden_tracking_pixel_stripped() {
+        let html = r#"<p>Notes</p><img src="https://tracker.com/px" style="display:none"/><p>More</p>"#;
+        let result = strip_tracking_pixels(html);
+        assert!(!result.contains("tracker.com"), "hidden tracking pixel should be stripped");
+    }
+
+    #[test]
+    fn test_zero_size_tracking_pixel_stripped() {
+        let html = r#"<p>Notes</p><img src="https://tracker.com/px" width="0" height="0"/><p>More</p>"#;
+        let result = strip_tracking_pixels(html);
+        assert!(!result.contains("tracker.com"), "zero-size tracking pixel should be stripped");
+    }
+
+    #[test]
+    fn test_ssrf_nat64_loopback_rejected() {
+        assert!(is_private_host("64:ff9b::7f00:1"));
+    }
+
+    #[test]
+    fn test_ssrf_nat64_private_rejected() {
+        // NAT64 embedding of 192.168.1.1
+        assert!(is_private_host("64:ff9b::c0a8:101"));
     }
 
     #[test]
