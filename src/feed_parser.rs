@@ -42,11 +42,26 @@
 //! caller already fetched. See the `PHASE 2 PORT` comment near
 //! [`parse_bytes`].
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::podcast_ns2;
 use crate::url_sanitizer::{sanitize_audio_url, sanitize_text, strip_tracking_pixels};
+
+/// Hard upper bound on a feed body. Far above any legitimate podcast feed
+/// (large public catalogues are 1–10 MiB), small enough that an
+/// adversarial 100 MiB feed is rejected outright before any allocation.
+const MAX_FEED_BYTES: usize = 32 * 1024 * 1024;
+
+/// Hard upper bound on the number of episodes we will surface from a
+/// single feed. Matches `podcast_ns2::MAX_ITEMS` so the NS2 pass and the
+/// `feed-rs` pass are bounded together.
+const MAX_EPISODES: usize = podcast_ns2::MAX_ITEMS;
+
+/// Maximum length we will retain for any individual text/URL string read
+/// from a feed. Anything longer is truncated; nothing legitimate is this
+/// long.
+const MAX_TEXT_LEN: usize = 4096;
 
 // ── Domain Types ──────────────────────────────────────────────────────────────
 
@@ -82,7 +97,9 @@ pub struct ParsedEpisode {
     pub description: Option<String>,
     /// Sanitised audio URL (analytics prefixes removed, HTTPS-only).
     pub audio_url: String,
-    /// Raw audio URL before sanitisation — stored encrypted for debugging.
+    /// Raw audio URL exactly as the feed declared it, retained so the
+    /// app can audit / explain what was stripped. NOT validated, NOT
+    /// privacy-safe — never use for fetches; consult `audio_url`.
     pub raw_audio_url: String,
     /// Episode duration in milliseconds, if the media element declared one.
     pub duration_ms: Option<u64>,
@@ -91,14 +108,20 @@ pub struct ParsedEpisode {
     pub file_size: Option<u64>,
     /// `<podcast:chapters>` URL.
     pub chapter_url: Option<String>,
+    /// `<podcast:chapters>` MIME type (HTML-escaped).
+    pub chapter_type: Option<String>,
     /// `<podcast:transcript>` URL.
     pub transcript_url: Option<String>,
-    /// `<podcast:transcript>` MIME type.
+    /// `<podcast:transcript>` MIME type (HTML-escaped).
     pub transcript_type: Option<String>,
     /// `<podcast:season>` number.
     pub season: Option<u32>,
     /// `<podcast:episode>` number.
     pub episode_number: Option<u32>,
+    /// `<podcast:soundbite>` highlight clips. Capped to a small bound
+    /// per episode in [`podcast_ns2`] so an adversarial feed cannot
+    /// allocate unbounded memory.
+    pub soundbites: Vec<podcast_ns2::Soundbite>,
     /// Published timestamp (unix seconds).
     pub published_at: Option<i64>,
 }
@@ -114,8 +137,16 @@ pub struct ParsedEpisode {
 ///
 /// # Errors
 ///
-/// Returns `Err` when `bytes` is not a parseable RSS/Atom feed.
+/// Returns `Err` when `bytes` is empty, exceeds [`MAX_FEED_BYTES`], or is
+/// not a parseable RSS/Atom feed.
 pub fn parse_bytes(bytes: &[u8]) -> Result<ParsedPodcast> {
+    if bytes.is_empty() {
+        bail!("empty feed body");
+    }
+    if bytes.len() > MAX_FEED_BYTES {
+        bail!("feed body exceeds {MAX_FEED_BYTES}-byte cap");
+    }
+
     let feed = feed_rs::parser::parse(bytes).context("RSS/Atom parse error")?;
 
     // Also parse the raw XML for Podcast Namespace 2.0 extensions that
@@ -129,7 +160,7 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<ParsedPodcast> {
     // All text fields from untrusted feeds are HTML-escaped to prevent XSS
     // when rendered in the WebView.
     let title = sanitize_text(
-        &feed.title.as_ref().map(|t| t.content.clone()).unwrap_or_default()
+        feed.title.as_ref().map(|t| t.content.as_str()).unwrap_or("")
     );
 
     let description = feed
@@ -147,18 +178,20 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<ParsedPodcast> {
     let author = feed
         .authors
         .first()
-        .map(|a| a.name.clone())
+        .map(|a| a.name.as_str())
         .filter(|n| !n.is_empty())
-        .map(|n| sanitize_text(&n));
+        .map(sanitize_text);
 
-    let language = feed.language.clone();
-
-    let category = feed.categories.first().map(|c| c.term.clone());
+    // `language` and `category` are RSS-supplied free text — escape them
+    // before any consumer interpolates them into HTML.
+    let language = feed.language.as_deref().map(sanitize_text);
+    let category = feed.categories.first().map(|c| sanitize_text(&c.term));
 
     // Pair each feed-rs entry with its raw XML <item> block for NS2 extraction.
     let episodes: Vec<ParsedEpisode> = feed
         .entries
         .into_iter()
+        .take(MAX_EPISODES)
         .enumerate()
         .filter_map(|(i, entry)| {
             let ns2_xml = item_blocks.get(i).copied().unwrap_or("");
@@ -204,6 +237,9 @@ fn parse_episode(entry: feed_rs::model::Entry, ns2_xml: &str) -> Option<ParsedEp
         })?;
 
     let raw_audio_url = enclosure.url.as_ref().map(ToString::to_string)?;
+    // Cap the raw URL we retain — a multi-megabyte URL string in
+    // `raw_audio_url` is never legitimate and would bloat memory.
+    let raw_audio_url = truncate_at(&raw_audio_url, MAX_TEXT_LEN).to_string();
     let audio_url = sanitize_audio_url(&raw_audio_url);
 
     let guid = if entry.id.is_empty() {
@@ -212,15 +248,13 @@ fn parse_episode(entry: feed_rs::model::Entry, ns2_xml: &str) -> Option<ParsedEp
         entry.id.clone()
     };
 
-    // Truncate GUIDs that are unreasonably long.
-    let guid = if guid.len() > 2048 {
-        guid.get(..2048).unwrap_or(&guid).to_string()
-    } else {
-        guid
-    };
+    // Truncate GUIDs that are unreasonably long. 2048 is the historical
+    // cap from boomleft-podcasts and is preserved for byte-for-byte
+    // compatibility with persisted records.
+    let guid = truncate_at(&guid, 2048).to_string();
 
     let title = sanitize_text(
-        &entry.title.as_ref().map(|t| t.content.clone()).unwrap_or_else(|| guid.clone())
+        entry.title.as_ref().map_or_else(|| guid.as_str(), |t| t.content.as_str())
     );
 
     let description = entry
@@ -258,36 +292,57 @@ fn parse_episode(entry: feed_rs::model::Entry, ns2_xml: &str) -> Option<ParsedEp
         duration_ms,
         file_size,
         chapter_url: ns2.chapter_url,
+        chapter_type: ns2.chapter_type,
         transcript_url: ns2.transcript_url,
         transcript_type: ns2.transcript_type,
         season: ns2.season,
         episode_number: ns2.episode_number,
+        soundbites: ns2.soundbites,
         published_at,
     })
 }
 
+/// Truncate a string at `max` bytes on a UTF-8 char boundary. Never
+/// panics — falls back to the empty prefix if no boundary at or before
+/// `max` exists (this is impossible for normal Unicode but the fallback
+/// keeps the function total).
+fn truncate_at(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut idx = max;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    s.get(..idx).unwrap_or("")
+}
+
 /// Sanitise an optional artwork / image URL from the feed.
-/// Only HTTPS public URLs are accepted; others return None.
+///
+/// Only HTTPS public URLs are accepted; others return None. The URL is
+/// re-parsed after the http→https upgrade so any hostile escape that
+/// `url::Url::parse` would normalise differently between the two schemes
+/// cannot slip through.
 fn sanitize_optional_url(url: &str) -> Option<String> {
-    let parsed = url::Url::parse(url).ok()?;
-    let url_str = if parsed.scheme() == "http" {
-        url.replacen("http://", "https://", 1)
-    } else if parsed.scheme() == "https" {
-        url.to_string()
-    } else {
+    if url.contains('\0') || url.len() > MAX_TEXT_LEN {
         return None;
+    }
+    let parsed = url::Url::parse(url).ok()?;
+    let upgraded = match parsed.scheme() {
+        "http" => url.replacen("http://", "https://", 1),
+        "https" => url.to_string(),
+        _ => return None,
     };
 
-    // Enforce the SSRF guard on artwork URLs — a malicious feed could
-    // point artwork to 169.254.169.254 or a local service, and the
-    // webview would make a request to it when rendering the <img> tag.
-    if let Some(host) = parsed.host_str() {
-        if crate::url_sanitizer::is_private_host(host) {
-            return None;
-        }
+    let reparsed = url::Url::parse(&upgraded).ok()?;
+    let host = reparsed.host_str()?;
+    // SSRF guard — a malicious feed could point artwork at
+    // `169.254.169.254` or a local service, and the webview would issue
+    // a request to it when rendering the `<img>` tag.
+    if crate::url_sanitizer::is_private_host(host) {
+        return None;
     }
-
-    Some(url_str)
+    Some(reparsed.to_string())
 }
 
 #[cfg(test)]
@@ -469,5 +524,92 @@ mod tests {
     fn test_parse_bytes_invalid_xml_returns_error() {
         let result = parse_bytes(b"this is not xml at all");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_bytes_empty_body_returns_error() {
+        let result = parse_bytes(b"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_bytes_oversized_body_returns_error() {
+        // We build a buffer larger than MAX_FEED_BYTES (32 MiB) and check
+        // the size guard fires before any allocation-heavy parse path.
+        let oversized = vec![b'x'; MAX_FEED_BYTES + 1];
+        let result = parse_bytes(&oversized);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_bytes_caps_episodes_at_max() {
+        use std::fmt::Write as _;
+        let mut feed = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Cap</title>"#,
+        );
+        for i in 0..(MAX_EPISODES + 25) {
+            let _ = write!(
+                feed,
+                r#"<item><title>e{i}</title><guid>g{i}</guid><enclosure url="https://cdn.example.com/{i}.mp3" type="audio/mpeg"/></item>"#,
+            );
+        }
+        feed.push_str("</channel></rss>");
+        let podcast = parse_bytes(feed.as_bytes()).unwrap();
+        assert!(podcast.episodes.len() <= MAX_EPISODES);
+    }
+
+    #[test]
+    fn test_parse_bytes_html_escapes_language_and_category() {
+        let feed = br#"<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0">
+          <channel>
+            <title>Cat</title>
+            <language>en&amp;us</language>
+            <category>news&amp;more</category>
+            <item>
+              <title>e</title>
+              <guid>g</guid>
+              <enclosure url="https://cdn.example.com/e.mp3" type="audio/mpeg"/>
+            </item>
+          </channel>
+        </rss>"#;
+        let podcast = parse_bytes(feed).unwrap();
+        // The raw `&` from the feed entity must be re-escaped so it is
+        // safe to interpolate into HTML text-node content downstream.
+        let lang = podcast.language.unwrap_or_default();
+        let cat = podcast.category.unwrap_or_default();
+        assert!(lang.contains("&amp;"), "language must be HTML-escaped: {lang}");
+        assert!(cat.contains("&amp;"), "category must be HTML-escaped: {cat}");
+    }
+
+    #[test]
+    fn test_parse_bytes_surfaces_chapter_type_and_soundbites() {
+        let podcast = parse_bytes(minimal_rss_feed()).unwrap();
+        let ep = &podcast.episodes[0];
+        assert_eq!(ep.chapter_type.as_deref(), Some("application/json+chapters"));
+        assert_eq!(ep.soundbites.len(), 1);
+        assert_eq!(ep.soundbites[0].title.as_deref(), Some("Best part"));
+    }
+
+    #[test]
+    fn test_sanitize_optional_url_rejects_private_host() {
+        assert!(sanitize_optional_url("https://192.168.1.1/art.jpg").is_none());
+        assert!(sanitize_optional_url("https://localhost/art.jpg").is_none());
+        assert!(sanitize_optional_url("https://[::1]/art.jpg").is_none());
+    }
+
+    #[test]
+    fn test_sanitize_optional_url_rejects_null_byte() {
+        assert!(sanitize_optional_url("https://example.com/art.jpg\0evil").is_none());
+    }
+
+    #[test]
+    fn test_truncate_at_utf8_boundary() {
+        // A 4-byte char straddling the cut must not panic and must not
+        // produce invalid UTF-8.
+        let s = "aaaa\u{1F600}bbb"; // 4-byte emoji
+        let cut = truncate_at(s, 6);
+        assert!(s.starts_with(cut));
+        assert!(cut.is_char_boundary(cut.len()));
     }
 }

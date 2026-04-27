@@ -40,6 +40,11 @@ use std::str::FromStr;
 
 // ── Prefix table ──────────────────────────────────────────────────────────────
 
+/// Hard upper bound on the length of a single URL we will inspect.
+/// Far larger than any legitimate audio URL; chosen to bound CPU /
+/// allocation cost of the iterative prefix-strip loop on hostile input.
+pub(crate) const MAX_URL_LEN: usize = 8192;
+
 /// A compile-time entry in the analytics-prefix blocklist.
 ///
 /// Matches a URL whose host equals [`Self::prefix_host`] and whose path
@@ -98,6 +103,14 @@ pub fn sanitize_audio_url(raw_url: &str) -> String {
     if raw_url.contains('\0') {
         tracing::warn!("url_sanitizer: null byte in URL, returning as-is");
         return raw_url.to_string();
+    }
+
+    // Hard cap on URL length. RFC 9110 has no formal upper bound, but a
+    // multi-megabyte URL is universally a DoS attempt; reject early so the
+    // (relatively expensive) parse / strip / re-parse loop never runs.
+    if raw_url.len() > MAX_URL_LEN {
+        tracing::warn!("url_sanitizer: URL exceeds MAX_URL_LEN, returning empty");
+        return String::new();
     }
 
     let mut url = raw_url.trim().to_string();
@@ -256,66 +269,85 @@ fn strip_one_prefix(url: &str, p: &PrefixStrip) -> Option<String> {
 }
 
 /// Remove tracking query parameters while preserving all other parameters.
+///
+/// Re-encodes kept pairs through `query_pairs_mut()` so that a value
+/// containing `&` (originally `%26`) cannot smuggle additional parameters
+/// when the URL is re-parsed downstream.
 fn strip_tracking_params(url: &str) -> Result<String, url::ParseError> {
     let mut parsed = url::Url::parse(url)?;
 
     let kept: Vec<(String, String)> = parsed
         .query_pairs()
         .filter(|(k, _)| {
-            let k_lower = k.to_lowercase();
-            !TRACKING_PARAMS.iter().any(|t| k_lower == *t)
-                && !k_lower.starts_with("utm_")
+            let k_lower = k.to_ascii_lowercase();
+            !TRACKING_PARAMS.iter().any(|t| k_lower == *t) && !k_lower.starts_with("utm_")
         })
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
 
-    if kept.is_empty() {
-        parsed.set_query(None);
-    } else {
-        let qs = kept
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        parsed.set_query(Some(&qs));
+    parsed.set_query(None);
+    if !kept.is_empty() {
+        let mut serializer = parsed.query_pairs_mut();
+        for (k, v) in &kept {
+            let _ = serializer.append_pair(k, v);
+        }
+        let _ = serializer.finish();
     }
 
     Ok(parsed.to_string())
 }
 
-/// Returns `true` if `host` is a private, loopback, or link-local address.
+/// Returns `true` if `host` is a private, loopback, link-local, or
+/// otherwise non-routable address.
 ///
-/// Covers IPv4 RFC-1918, loopback (127.x, ::1), link-local (169.254.x,
-/// fe80::/10), and the APIPA / CGN ranges used by cloud metadata services
-/// (169.254.169.254, 100.64.0.0/10).
+/// Covers IPv4 RFC-1918, loopback (`127.0.0.0/8`, `::1`), link-local
+/// (`169.254.0.0/16`, `fe80::/10`), CGN (`100.64.0.0/10`), benchmark
+/// (`198.18.0.0/15`), documentation (`192.0.2.0/24`, `198.51.100.0/24`,
+/// `203.0.113.0/24`, `2001:db8::/32`), multicast (`224.0.0.0/4`,
+/// `ff00::/8`), reserved (`240.0.0.0/4`), the cloud metadata APIPA
+/// (`169.254.169.254`, already covered by link-local), and `0.0.0.0`.
+///
+/// In addition, hostnames using non-decimal-dotted-quad encodings
+/// (`0x7f000001`, `0177.0.0.1`) are rejected even when the `url` crate
+/// would have normalised them — defense in depth in case a future caller
+/// passes a host string that bypasses crate normalisation.
 #[must_use]
 pub fn is_private_host(host: &str) -> bool {
-    let lower = host.to_lowercase();
+    let lower = host.to_ascii_lowercase();
 
     // Reject localhost and subdomains.
     if lower == "localhost" || lower.ends_with(".localhost") {
         return true;
     }
 
-    // Reject octal/hex IP notations used for SSRF bypass (e.g., 0x7f000001, 0177.0.0.1).
-    if lower.starts_with("0x") || lower.contains(".0x") ||
-       (lower.starts_with('0') && lower.contains('.') &&
-        lower.split('.').any(|oct| oct.len() > 1 && oct.starts_with('0') && oct.chars().all(|c| c.is_ascii_digit()))) {
+    // Reject hex / octal IPv4 encodings used for SSRF bypass.
+    // - hex:    `0x7f000001`, `0xc0.0xa8.0x01.0x01`
+    // - octal:  `0177.0.0.1`
+    // We only flag tokens that look numerically motivated — a domain
+    // segment that happens to start with a `0` digit (e.g. `0day.example`)
+    // is left alone.
+    if lower.starts_with("0x") && lower.as_bytes().get(2).is_some_and(u8::is_ascii_hexdigit) {
         return true;
     }
-
-    // Standard IP parsing.
-    if let Ok(addr) = IpAddr::from_str(host) {
-        return is_private_ip(addr);
+    let segments: Vec<&str> = lower.split('.').collect();
+    if segments.len() >= 2 && segments.iter().all(|s| !s.is_empty()) {
+        let any_hex = segments.iter().any(|s| s.starts_with("0x")
+            && s.len() > 2
+            && s.as_bytes().iter().skip(2).all(u8::is_ascii_hexdigit));
+        let any_octal = segments.iter().any(|s| s.len() > 1
+            && s.starts_with('0')
+            && s.bytes().all(|b| b.is_ascii_digit()));
+        if any_hex || any_octal {
+            return true;
+        }
     }
 
-    // Bracketed IPv6 ("[::1]") — strip brackets.
-    if host.starts_with('[') && host.ends_with(']') {
-        if let Some(inner) = host.get(1..host.len() - 1) {
-            if let Ok(addr) = IpAddr::from_str(inner) {
-                return is_private_ip(addr);
-            }
-        }
+    // Bracketed IPv6 (`[::1]`) — strip brackets and any RFC 6874 zone-id
+    // suffix (`%eth0`, encoded as `%25eth0`) before parsing.
+    let candidate = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(host);
+    let candidate = candidate.split('%').next().unwrap_or(candidate);
+    if let Ok(addr) = IpAddr::from_str(candidate) {
+        return is_private_ip(addr);
     }
 
     false
@@ -327,8 +359,10 @@ fn is_private_ip(addr: IpAddr) -> bool {
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
-                || is_cgnat(v4)          // 100.64.0.0/10
+                || is_cgnat(v4)          // 100.64.0.0/10 (carrier-grade NAT)
                 || is_documentation(v4)  // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+                || is_benchmark(v4)      // 198.18.0.0/15
+                || is_reserved_or_multicast(v4) // 224.0.0.0/4 + 240.0.0.0/4
                 || v4.is_broadcast()
                 || v4.is_unspecified()
         }
@@ -343,6 +377,8 @@ fn is_private_ip(addr: IpAddr) -> bool {
                 || v6.is_unspecified()
                 || is_link_local_v6(v6)
                 || is_unique_local_v6(v6)
+                || is_multicast_v6(v6)
+                || is_documentation_v6(v6)
         }
     }
 }
@@ -361,6 +397,18 @@ fn is_documentation(v4: Ipv4Addr) -> bool {
         || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
 }
 
+fn is_benchmark(v4: Ipv4Addr) -> bool {
+    // 198.18.0.0/15 — RFC 2544 benchmark testing range.
+    let octets = v4.octets();
+    octets[0] == 198 && (octets[1] & 0xFE) == 18
+}
+
+fn is_reserved_or_multicast(v4: Ipv4Addr) -> bool {
+    // 224.0.0.0/4 (multicast) and 240.0.0.0/4 (reserved/future use).
+    let octets = v4.octets();
+    octets[0] >= 224
+}
+
 fn is_link_local_v6(v6: Ipv6Addr) -> bool {
     // fe80::/10
     let segments = v6.segments();
@@ -371,6 +419,18 @@ fn is_unique_local_v6(v6: Ipv6Addr) -> bool {
     // fc00::/7
     let segments = v6.segments();
     (segments[0] & 0xFE00) == 0xFC00
+}
+
+fn is_multicast_v6(v6: Ipv6Addr) -> bool {
+    // ff00::/8
+    let segments = v6.segments();
+    (segments[0] & 0xFF00) == 0xFF00
+}
+
+fn is_documentation_v6(v6: Ipv6Addr) -> bool {
+    // 2001:db8::/32 (RFC 3849 documentation prefix).
+    let segments = v6.segments();
+    segments[0] == 0x2001 && segments[1] == 0x0db8
 }
 
 // ── HTML text sanitisation ───────────────────────────────────────────────────
@@ -449,9 +509,41 @@ pub fn strip_tracking_pixels(html: &str) -> String {
 }
 
 fn is_tracking_pixel(img_tag: &str) -> bool {
-    let lower = img_tag.to_lowercase();
-    (lower.contains("width=\"1\"") || lower.contains("width='1'"))
-        && (lower.contains("height=\"1\"") || lower.contains("height='1'"))
+    let lower = img_tag.to_ascii_lowercase();
+    has_dim_one(&lower, "width") && has_dim_one(&lower, "height")
+}
+
+/// True if `tag_lower` contains `name=1` / `name="1"` / `name='1'`,
+/// tolerating surrounding whitespace, single or double quotes, and
+/// unquoted values. Required to catch hand-crafted tracking pixels that
+/// bypass the more rigid `width="1"`/`height="1"` exact match.
+fn has_dim_one(tag_lower: &str, name: &str) -> bool {
+    let bytes = tag_lower.as_bytes();
+    let needle = format!("{name}=");
+    let mut search = 0;
+    while let Some(rel) = tag_lower.get(search..).and_then(|t| t.find(&needle)) {
+        let pos = search + rel;
+        // Boundary check — `name=` must be preceded by whitespace so
+        // `pixwidth=` doesn't false-positive the `width=` check.
+        let boundary = pos == 0 || bytes.get(pos - 1).is_some_and(u8::is_ascii_whitespace);
+        if boundary {
+            let after = pos + needle.len();
+            let mut value = tag_lower.get(after..).unwrap_or("").trim_start();
+            // Strip optional quote character.
+            if value.starts_with('"') || value.starts_with('\'') {
+                value = value.get(1..).unwrap_or("");
+            }
+            if value.starts_with('1') {
+                let next = value.as_bytes().get(1).copied();
+                let stops = matches!(next, None | Some(b'"' | b'\'' | b' ' | b'/' | b'>' | b'\t' | b'\n' | b'\r'));
+                if stops {
+                    return true;
+                }
+            }
+        }
+        search = pos + needle.len();
+    }
+    false
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -622,6 +714,116 @@ mod tests {
     #[test]
     fn test_ipv6_loopback_rejected() {
         assert!(validate_audio_url("https://[::1]/ep.mp3").is_err());
+    }
+
+    // ── New SSRF regression coverage ────────────────────────────────────────
+
+    #[test]
+    fn test_hex_ipv4_encoding_rejected() {
+        assert!(is_private_host("0x7f000001"));
+        assert!(is_private_host("0xc0.0xa8.0x01.0x01"));
+    }
+
+    #[test]
+    fn test_octal_ipv4_encoding_rejected() {
+        assert!(is_private_host("0177.0.0.1"));
+    }
+
+    #[test]
+    fn test_legitimate_hostname_starting_with_digit_not_rejected() {
+        // `0day.example` and `1.example` must still be allowed — the
+        // octal-bypass guard must not over-flag these.
+        assert!(!is_private_host("0day.example"));
+        assert!(!is_private_host("1.example"));
+        assert!(!is_private_host("9to5mac.com"));
+    }
+
+    #[test]
+    fn test_ipv4_multicast_rejected() {
+        assert!(validate_audio_url("https://224.0.0.1/ep.mp3").is_err());
+    }
+
+    #[test]
+    fn test_ipv4_reserved_rejected() {
+        assert!(validate_audio_url("https://240.0.0.1/ep.mp3").is_err());
+    }
+
+    #[test]
+    fn test_ipv4_benchmark_rejected() {
+        assert!(validate_audio_url("https://198.18.0.1/ep.mp3").is_err());
+        assert!(validate_audio_url("https://198.19.0.1/ep.mp3").is_err());
+    }
+
+    #[test]
+    fn test_ipv6_multicast_rejected() {
+        assert!(validate_audio_url("https://[ff02::1]/ep.mp3").is_err());
+    }
+
+    #[test]
+    fn test_ipv6_documentation_rejected() {
+        assert!(validate_audio_url("https://[2001:db8::1]/ep.mp3").is_err());
+    }
+
+    #[test]
+    fn test_ipv6_zone_id_does_not_bypass() {
+        // Bracketed IPv6 with RFC 6874 zone-id (`%25eth0` percent-encoded
+        // form) must still reject loopback once stripped. We feed the host
+        // form directly, since `url::Url::parse` may or may not preserve it.
+        assert!(is_private_host("[::1%25eth0]"));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_ipv6_loopback_rejected() {
+        assert!(validate_audio_url("https://[::ffff:127.0.0.1]/ep.mp3").is_err());
+    }
+
+    // ── Tracking pixel hardening ────────────────────────────────────────────
+
+    #[test]
+    fn test_tracking_pixel_unquoted_attrs_stripped() {
+        let html = r#"<p>a</p><img src=x width=1 height=1><p>b</p>"#;
+        let result = strip_tracking_pixels(html);
+        assert!(!result.contains("src=x"));
+        assert!(result.contains('a'));
+        assert!(result.contains('b'));
+    }
+
+    #[test]
+    fn test_tracking_pixel_single_quoted_stripped() {
+        let html = r#"<img src='x' width='1' height='1'/>"#;
+        let result = strip_tracking_pixels(html);
+        assert!(!result.contains("src="));
+    }
+
+    #[test]
+    fn test_tracking_pixel_pixwidth_does_not_false_positive() {
+        // A non-tracking img with a custom `pixwidth=1` attribute and no
+        // real width="1" must NOT be removed.
+        let html = r#"<img src="real.jpg" pixwidth="1" pixheight="1" alt="ok"/>"#;
+        let result = strip_tracking_pixels(html);
+        assert!(result.contains("real.jpg"), "non-tracking img must survive");
+    }
+
+    // ── Query smuggling regression ──────────────────────────────────────────
+
+    #[test]
+    fn test_query_string_no_smuggle_via_ampersand() {
+        // The `keep` value contains an encoded ampersand. After we strip
+        // tracking params and re-emit, the ampersand must remain encoded
+        // so the upstream server sees a single param, not two.
+        let raw = "https://cdn.example.com/ep.mp3?utm_source=spam&keep=foo%26bar%3D1";
+        let result = sanitize_audio_url(raw);
+        assert!(result.contains("foo%26bar"), "ampersand must remain encoded: {result}");
+        assert!(!result.contains("utm_source"));
+    }
+
+    // ── Length cap ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_oversized_url_rejected() {
+        let long = format!("https://cdn.example.com/{}", "a".repeat(MAX_URL_LEN + 100));
+        let result = sanitize_audio_url(&long);
+        assert_eq!(result, "");
     }
 
     #[test]
